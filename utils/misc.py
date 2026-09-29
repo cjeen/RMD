@@ -2,6 +2,8 @@ import numpy as np
 import random
 import torch
 
+from utils.device import seed_all
+
 
 def set_seed(seed: int, deterministic: bool = False):
     """
@@ -15,8 +17,7 @@ def set_seed(seed: int, deterministic: bool = False):
     """
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    seed_all(seed)
 
     if deterministic:
         torch.use_deterministic_algorithms(True)

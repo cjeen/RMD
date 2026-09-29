@@ -1,3 +1,1 @@
-from . import configs, distributed, modules
-from .image2video import WanI2V
-from .text2video import WanT2V
+"""Wan backbone components used by RMD (adapted from Wan and Self Forcing)."""

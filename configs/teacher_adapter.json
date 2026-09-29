@@ -1,0 +1,10 @@
+{
+  "base_model": "Wan2.1-T2V-14B",
+  "adapter_name": "default",
+  "global_step": 3800,
+  "lora_rank": 128,
+  "lora_alpha": 128,
+  "target_modules": ["q", "k", "v", "o", "ffn.0", "ffn.2"],
+  "num_frame_per_block": 1,
+  "temporal_mode": "independent_frame_serial"
+}

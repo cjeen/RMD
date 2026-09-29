@@ -30,10 +30,18 @@ class BaseModel(nn.Module):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name,
+            is_causal=False,
+            **getattr(args, "real_score_model_kwargs", {}),
+        )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name,
+            is_causal=False,
+            **getattr(args, "fake_score_model_kwargs", {}),
+        )
         self.fake_score.model.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder()
@@ -217,6 +225,31 @@ class SelfForcingModel(BaseModel):
             independent_first_frame=self.args.independent_first_frame,
             same_step_across_blocks=self.args.same_step_across_blocks,
             last_step_only=self.args.last_step_only,
+            first_denoising_step_only=getattr(
+                self.args, "first_denoising_step_only", False
+            ),
+            exit_last_n_steps=getattr(self.args, "exit_last_n_steps", None),
+            random_first_block_exit=getattr(
+                self.args, "random_first_block_exit", False
+            ),
+            first_block_first_denoising_step=getattr(
+                self.args, "first_block_first_denoising_step", False
+            ),
+            fixed_first_block_exit_steps_path=getattr(
+                self.args, "fixed_first_block_exit_steps_path", None
+            ),
+            fixed_first_block_exit_steps_limit=getattr(
+                self.args, "fixed_first_block_exit_steps_limit", None
+            ),
+            configured_denoising_step_labels=list(
+                self.args.denoising_step_list
+            ),
             num_max_frames=self.num_training_frames,
-            context_noise=self.args.context_noise
+            context_noise=self.args.context_noise,
+            skip_final_cache_update=getattr(
+                self.args, "skip_final_cache_update", False
+            ),
+            rollout_hide_first_frame_after=getattr(
+                self.args, "rollout_hide_first_frame_after", None
+            ),
         )

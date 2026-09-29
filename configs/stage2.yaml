@@ -1,0 +1,58 @@
+generator_ckpt: ${oc.env:STAGE1_CKPT,logs/stage1/checkpoint_model_000900/model.pt}
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+text_encoder_fsdp_wrap_strategy: size
+
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+
+mixed_precision: true
+seed: 0
+sharding_strategy: hybrid_full
+
+lr: 2.0e-6
+lr_critic: 4.0e-7
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+batch_size: 1
+num_workers: 8
+
+data_format: precomputed_wan_jsonl
+data_meta_path: ${oc.env:TRAIN_META,data/train.jsonl}
+i2v: false
+
+log_iters: 100
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: video_dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 1
+tf_replay_passes: 1
+load_raw_video: false
+
+model_kwargs:
+  timestep_shift: 5.0
+
+# Count outer training iterations, as in the original experiment.
+max_steps: 800

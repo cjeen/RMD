@@ -31,35 +31,42 @@ def rope_params(max_seq_len, dim, theta=10000):
     freqs = torch.outer(
         torch.arange(max_seq_len),
         1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+                        torch.arange(0, dim, 2).div(dim)))
+    return torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=-1)
 
 
 # @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Use real-valued rotary math because NPU does not support the complex
+    # operations used by the original implementation.
+    freqs_cos = freqs[..., 0]
+    freqs_sin = freqs[..., 1]
+    freqs_cos = freqs_cos.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freqs_sin = freqs_sin.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = x[i, :seq_len].reshape(seq_len, n, -1, 2)
+        x_real = x_i[..., 0]
+        x_imag = x_i[..., 1]
+        freqs_cos_i = torch.cat([
+            freqs_cos[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_cos[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_cos[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
+        freqs_sin_i = torch.cat([
+            freqs_sin[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_sin[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_sin[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
+        out_real = x_real * freqs_cos_i - x_imag * freqs_sin_i
+        out_imag = x_real * freqs_sin_i + x_imag * freqs_cos_i
+        x_i = torch.stack([out_real, out_imag], dim=-1).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection

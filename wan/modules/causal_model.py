@@ -27,8 +27,12 @@ flex_attention = torch.compile(
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Use real-valued rotary math because NPU does not support the complex
+    # operations used by the original implementation.
+    freqs_cos = freqs[..., 0]
+    freqs_sin = freqs[..., 1]
+    freqs_cos = freqs_cos.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    freqs_sin = freqs_sin.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     # loop over samples
     output = []
@@ -36,18 +40,22 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = x[i, :seq_len].reshape(seq_len, n, -1, 2)
+        x_real = x_i[..., 0]
+        x_imag = x_i[..., 1]
+        freqs_cos_i = torch.cat([
+            freqs_cos[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_cos[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_cos[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
+        freqs_sin_i = torch.cat([
+            freqs_sin[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs_sin[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs_sin[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
+        out_real = x_real * freqs_cos_i - x_imag * freqs_sin_i
+        out_imag = x_real * freqs_sin_i + x_imag * freqs_cos_i
+        x_i = torch.stack([out_real, out_imag], dim=-1).flatten(2)
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
@@ -83,6 +91,97 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def _teacher_forcing_attention_npu(
+        self,
+        q,
+        k,
+        v,
+        grid_sizes,
+        freqs,
+        first_frame_visibility_mask=None,
+        hidden_prefix_frames=1,
+        num_frame_per_block=1,
+    ):
+        """Equivalent causal clean-history attention using NPU fused attention."""
+        frame_count = int(grid_sizes[0][0].item())
+        frame_seqlen = int(grid_sizes[0][1].item() * grid_sizes[0][2].item())
+        if num_frame_per_block < 1 or frame_count % num_frame_per_block:
+            raise ValueError("NPU teacher forcing requires complete positive-sized blocks")
+        if self.local_attn_size != -1:
+            raise ValueError("GPU teacher-forcing mask has no local window; use local_attn_size=-1")
+        expected_seq_len = frame_count * frame_seqlen * 2
+        if q.shape[1] != expected_seq_len:
+            raise ValueError(
+                "NPU teacher-forcing attention expects matching clean/noisy frame layouts: "
+                f"got {q.shape[1]} tokens, expected {expected_seq_len}."
+            )
+        visibility = None
+        if first_frame_visibility_mask is not None:
+            if not 1 <= hidden_prefix_frames <= frame_count:
+                raise ValueError(
+                    "hidden_prefix_frames must be between 1 and frame_count"
+                )
+            if first_frame_visibility_mask.ndim == 2:
+                if int(first_frame_visibility_mask.shape[0]) != 1:
+                    raise ValueError(
+                        "NPU teacher forcing requires one shared visibility mask"
+                    )
+                first_frame_visibility_mask = first_frame_visibility_mask[0]
+            if tuple(first_frame_visibility_mask.shape) != (frame_count,):
+                raise ValueError(
+                    "first_frame_visibility_mask must contain one value per frame"
+                )
+            visibility = first_frame_visibility_mask.to(
+                device="cpu", dtype=torch.bool
+            ).tolist()
+
+        q_clean, q_noisy = torch.chunk(q, 2, dim=1)
+        k_clean, k_noisy = torch.chunk(k, 2, dim=1)
+        v_clean, v_noisy = torch.chunk(v, 2, dim=1)
+        q_clean = rope_apply(q_clean, grid_sizes, freqs).type_as(v)
+        k_clean = rope_apply(k_clean, grid_sizes, freqs).type_as(v)
+        q_noisy = rope_apply(q_noisy, grid_sizes, freqs).type_as(v)
+        k_noisy = rope_apply(k_noisy, grid_sizes, freqs).type_as(v)
+
+        clean_outputs = []
+        noisy_outputs = []
+        hidden_prefix_tokens = hidden_prefix_frames * frame_seqlen
+        for first_frame in range(0, frame_count, num_frame_per_block):
+            start = first_frame * frame_seqlen
+            end = (first_frame + num_frame_per_block) * frame_seqlen
+            clean_outputs.append(attention(
+                q_clean[:, start:end], k_clean[:, :end], v_clean[:, :end],
+            ))
+            # Merge consecutive query frames with the same prefix visibility.
+            # Every query still sees the entire current noisy block, and only
+            # clean history BEFORE this block (never its own clean frames).
+            query_frame = first_frame
+            while query_frame < first_frame + num_frame_per_block:
+                visible = visibility is None or visibility[query_frame]
+                query_end_frame = query_frame + 1
+                while query_end_frame < first_frame + num_frame_per_block:
+                    next_visible = visibility is None or visibility[query_end_frame]
+                    if next_visible != visible:
+                        break
+                    query_end_frame += 1
+                history_start = 0 if visible else min(start, hidden_prefix_tokens)
+                noisy_key = torch.cat([
+                    k_clean[:, history_start:start], k_noisy[:, start:end],
+                ], dim=1)
+                noisy_value = torch.cat([
+                    v_clean[:, history_start:start], v_noisy[:, start:end],
+                ], dim=1)
+                noisy_outputs.append(attention(
+                    q_noisy[:, query_frame * frame_seqlen:query_end_frame * frame_seqlen],
+                    noisy_key, noisy_value,
+                ))
+                query_frame = query_end_frame
+
+        return torch.cat(
+            [torch.cat(clean_outputs, dim=1), torch.cat(noisy_outputs, dim=1)],
+            dim=1,
+        )
+
     def forward(
         self,
         x,
@@ -92,7 +191,11 @@ class CausalWanSelfAttention(nn.Module):
         block_mask,
         kv_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        kv_cache_attention_start=None,
+        teacher_forcing_first_frame_visibility_mask=None,
+        teacher_forcing_hidden_prefix_frames=1,
+        teacher_forcing_num_frame_per_block=1,
     ):
         r"""
         Args:
@@ -119,6 +222,23 @@ class CausalWanSelfAttention(nn.Module):
             # if it is teacher forcing training?
             is_tf = (s == seq_lens[0].item() * 2)
             if is_tf:
+                if q.device.type == "npu":
+                    x = self._teacher_forcing_attention_npu(
+                        q,
+                        k,
+                        v,
+                        grid_sizes,
+                        freqs,
+                        first_frame_visibility_mask=(
+                            teacher_forcing_first_frame_visibility_mask
+                        ),
+                        hidden_prefix_frames=(
+                            teacher_forcing_hidden_prefix_frames
+                        ),
+                        num_frame_per_block=teacher_forcing_num_frame_per_block,
+                    )
+                    x = x.flatten(2)
+                    return self.o(x)
                 q_chunk = torch.chunk(q, 2, dim=1)
                 k_chunk = torch.chunk(k, 2, dim=1)
                 roped_query = []
@@ -226,10 +346,23 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+            attention_start = max(0, local_end_index - self.max_attention_size)
+            if kv_cache_attention_start is not None:
+                # Convert the requested global-token lower bound to the cache's
+                # local coordinate system. This lets rollout queries skip GT0
+                # without deleting it from the cache for earlier frames.
+                requested_local_start = (
+                    local_end_index - (current_end - kv_cache_attention_start)
+                )
+                attention_start = max(attention_start, requested_local_start)
+            if attention_start >= local_end_index:
+                raise ValueError(
+                    "kv_cache_attention_start excludes every available KV token"
+                )
             x = attention(
                 roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                kv_cache["k"][:, attention_start:local_end_index],
+                kv_cache["v"][:, attention_start:local_end_index]
             )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
@@ -293,7 +426,11 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        kv_cache_attention_start=None,
+        teacher_forcing_first_frame_visibility_mask=None,
+        teacher_forcing_hidden_prefix_frames=1,
+        teacher_forcing_num_frame_per_block=1,
     ):
         r"""
         Args:
@@ -313,7 +450,20 @@ class CausalWanAttentionBlock(nn.Module):
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start)
+            freqs,
+            block_mask,
+            kv_cache,
+            current_start,
+            cache_start,
+            kv_cache_attention_start,
+            teacher_forcing_first_frame_visibility_mask=(
+                teacher_forcing_first_frame_visibility_mask
+            ),
+            teacher_forcing_hidden_prefix_frames=(
+                teacher_forcing_hidden_prefix_frames
+            ),
+            teacher_forcing_num_frame_per_block=teacher_forcing_num_frame_per_block,
+        )
 
         # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -563,7 +713,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     @staticmethod
     def _prepare_teacher_forcing_mask(
         device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1
+        frame_seqlen: int = 1560, num_frame_per_block=1,
+        first_frame_visibility_mask: torch.Tensor | None = None,
+        hidden_prefix_frames: int = 1,
     ) -> BlockMask:
         """
         we will divide the token sequence into the following format
@@ -577,6 +729,25 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             frame_seqlen = 256
 
         total_length = num_frames * frame_seqlen * 2
+        if first_frame_visibility_mask is not None:
+            if not 1 <= hidden_prefix_frames <= num_frames:
+                raise ValueError(
+                    "hidden_prefix_frames must be between 1 and num_frames"
+                )
+            if first_frame_visibility_mask.ndim == 2:
+                if int(first_frame_visibility_mask.shape[0]) != 1:
+                    raise ValueError(
+                        "Batch-specific prefix visibility requires batch_size=1"
+                    )
+                first_frame_visibility_mask = first_frame_visibility_mask[0]
+            if tuple(first_frame_visibility_mask.shape) != (num_frames,):
+                raise ValueError(
+                    "first_frame_visibility_mask must be [num_frames] or [1, num_frames]"
+                )
+            first_frame_visibility_mask = first_frame_visibility_mask.to(
+                device=device, dtype=torch.bool
+            )
+        hidden_prefix_tokens = hidden_prefix_frames * frame_seqlen
 
         # we do right padding to get to a multiple of 128
         padded_length = math.ceil(total_length / 128) * 128 - total_length
@@ -627,12 +798,35 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             C1 = (kv_idx < noise_noise_ends[q_idx]) & (kv_idx >= noise_noise_starts[q_idx])
             C2 = (kv_idx < noise_context_ends[q_idx]) & (kv_idx >= noise_context_starts[q_idx])
             noise_mask = (q_idx >= clean_ends) & (C1 | C2)
+            if first_frame_visibility_mask is not None:
+                query_frame = torch.clamp(
+                    (q_idx - clean_ends) // frame_seqlen, 0, num_frames - 1
+                )
+                hide_conditioning_prefix = (
+                    (q_idx >= clean_ends)
+                    & (kv_idx < hidden_prefix_tokens)
+                    & (~first_frame_visibility_mask[query_frame])
+                )
+                noise_mask = noise_mask & (~hide_conditioning_prefix)
 
             eye_mask = q_idx == kv_idx
             return eye_mask | clean_mask | noise_mask
 
-        block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
-                                       KV_LEN=total_length + padded_length, _compile=False, device=device)
+        # Eager create_block_mask materializes a 65k x 65k temporary mask for
+        # 21-frame teacher forcing and needs roughly 32 GiB of scratch memory.
+        # Return rollout cache reservations first, then compile mask creation so
+        # the reduction is fused instead of allocating that dense temporary.
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
+        block_mask = create_block_mask(
+            attention_mask,
+            B=None,
+            H=None,
+            Q_LEN=total_length + padded_length,
+            KV_LEN=total_length + padded_length,
+            _compile=True,
+            device=device,
+        )
 
         if DEBUG:
             print(block_mask)
@@ -720,7 +914,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        kv_cache_attention_start: int | None = None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -815,7 +1010,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     {
                         "kv_cache": kv_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "kv_cache_attention_start": kv_cache_attention_start,
                     }
                 )
                 x = torch.utils.checkpoint.checkpoint(
@@ -829,7 +1025,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "kv_cache_attention_start": kv_cache_attention_start,
                     }
                 )
                 x = block(x, **kwargs)
@@ -848,6 +1045,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         seq_len,
         clean_x=None,
         aug_t=None,
+        teacher_forcing_first_frame_visibility_mask=None,
+        teacher_forcing_hidden_prefix_frames=1,
         clip_fea=None,
         y=None,
     ):
@@ -879,8 +1078,26 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # Construct blockwise causal attn mask
-        if self.block_mask is None:
+        # Construct blockwise causal attn mask. A replay visibility mask is sampled
+        # every step, so it must not be stored in the normal static-mask cache.
+        block_mask = None
+        if torch.device(device).type == "npu" and clean_x is not None:
+            # NPU teacher forcing uses _teacher_forcing_attention_npu, which
+            # implements the causal clean-history layout directly and never
+            # consumes a FlexAttention BlockMask. Avoid create_block_mask here:
+            # it invokes TorchInductor/Triton and requires a host GCC >= 9.
+            block_mask = None
+        elif clean_x is not None and teacher_forcing_first_frame_visibility_mask is not None:
+            if self.independent_first_frame:
+                raise NotImplementedError()
+            block_mask = self._prepare_teacher_forcing_mask(
+                device, num_frames=x.shape[2],
+                frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                num_frame_per_block=self.num_frame_per_block,
+                first_frame_visibility_mask=teacher_forcing_first_frame_visibility_mask,
+                hidden_prefix_frames=teacher_forcing_hidden_prefix_frames,
+            )
+        elif self.block_mask is None:
             if clean_x is not None:
                 if self.independent_first_frame:
                     raise NotImplementedError()
@@ -905,6 +1122,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
+            block_mask = self.block_mask
+        else:
+            block_mask = self.block_mask
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -971,7 +1191,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=block_mask,
+            teacher_forcing_first_frame_visibility_mask=(
+                teacher_forcing_first_frame_visibility_mask
+            ),
+            teacher_forcing_hidden_prefix_frames=(
+                teacher_forcing_hidden_prefix_frames
+            ),
+            teacher_forcing_num_frame_per_block=self.num_frame_per_block,
+        )
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

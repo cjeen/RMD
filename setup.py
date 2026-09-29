@@ -1,6 +1,6 @@
 from setuptools import setup, find_packages
 setup(
-    name="self_forcing",
-    version="0.0.1",
+    name="rollout-marginal-distillation",
+    version="0.1.0",
     packages=find_packages(),
 )

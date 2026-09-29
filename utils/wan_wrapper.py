@@ -1,14 +1,26 @@
+import math
+import os
 import types
+from pathlib import Path
 from typing import List, Optional
 import torch
 from torch import nn
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
+from utils.device import get_module_device
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+
+
+def _wan_1p3b_root() -> Path:
+    return Path(os.environ.get("WAN_MODEL_ROOT", str(_wan_root() / "Wan2.1-T2V-1.3B")))
+
+
+def _wan_root() -> Path:
+    return Path(os.environ.get("WAN_MODEL_DIR", "wan_models"))
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -22,17 +34,19 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(_wan_1p3b_root() / "models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=str(_wan_1p3b_root() / "google/umt5-xxl/"), seq_len=512, clean='whitespace')
 
     @property
     def device(self):
-        # Assume we are always on GPU
-        return torch.cuda.current_device()
+        # DynamicSwapInstaller keeps the registered parameters on CPU but
+        # exposes a device-local weight when the embedding is accessed. Input
+        # token IDs must follow that effective weight, not parameters().
+        return self.text_encoder.token_embedding.weight.device
 
     def forward(self, text_prompts: List[str]) -> dict:
         ids, mask = self.tokenizer(
@@ -66,7 +80,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=str(_wan_1p3b_root() / "Wan2.1_VAE.pth"),
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -124,10 +138,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         super().__init__()
 
         if is_causal:
+            model_path = _wan_1p3b_root() if model_name == "Wan2.1-T2V-1.3B" else _wan_root() / model_name
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                str(model_path), local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            model_path = _wan_1p3b_root() if model_name == "Wan2.1-T2V-1.3B" else _wan_root() / model_name
+            self.model = WanModel.from_pretrained(str(model_path))
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep
@@ -138,11 +154,18 @@ class WanDiffusionWrapper(torch.nn.Module):
         )
         self.scheduler.set_timesteps(1000, training=True)
 
-        self.seq_len = 32760  # [1, 21, 16, 60, 104]
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:
-        self.model.enable_gradient_checkpointing()
+        try:
+            self.model.enable_gradient_checkpointing()
+        except TypeError as exc:
+            if "_set_gradient_checkpointing" not in str(exc):
+                raise
+            # Older Wan models use `_set_gradient_checkpointing(module, value)`,
+            # while newer diffusers calls it with `enable=...`. The Wan forward
+            # path only reads this flag, so setting it directly is equivalent.
+            self.model.gradient_checkpointing = True
 
     def adding_cls_branch(self, atten_dim=1536, num_class=4, time_embed_dim=0) -> None:
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
@@ -225,9 +248,13 @@ class WanDiffusionWrapper(torch.nn.Module):
         concat_time_embeddings: Optional[bool] = False,
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
-        cache_start: Optional[int] = None
+        teacher_forcing_first_frame_visibility_mask: Optional[torch.Tensor] = None,
+        teacher_forcing_hidden_prefix_frames: int = 1,
+        cache_start: Optional[int] = None,
+        kv_cache_attention_start: Optional[int] = None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
+        seq_len = self._get_seq_len(noisy_image_or_video)
 
         # [B, F] -> [B]
         if self.uniform_timestep:
@@ -241,11 +268,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
-                seq_len=self.seq_len,
+                seq_len=seq_len,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                kv_cache_attention_start=kv_cache_attention_start,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -253,16 +281,22 @@ class WanDiffusionWrapper(torch.nn.Module):
                 flow_pred = self.model(
                     noisy_image_or_video.permute(0, 2, 1, 3, 4),
                     t=input_timestep, context=prompt_embeds,
-                    seq_len=self.seq_len,
+                    seq_len=seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
+                    teacher_forcing_first_frame_visibility_mask=(
+                        teacher_forcing_first_frame_visibility_mask
+                    ),
+                    teacher_forcing_hidden_prefix_frames=(
+                        teacher_forcing_hidden_prefix_frames
+                    ),
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
                     flow_pred, logits = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
+                        seq_len=seq_len,
                         classify_mode=True,
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
@@ -274,7 +308,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=seq_len
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(
@@ -309,3 +343,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         We can gradually add more methods here if needed.
         """
         self.get_scheduler()
+
+    def _get_seq_len(self, noisy_image_or_video: torch.Tensor) -> int:
+        _, num_frames, _, height, width = noisy_image_or_video.shape
+        patch_t, patch_h, patch_w = self.model.patch_size
+        patched_frames = math.ceil(num_frames / patch_t)
+        patched_height = math.ceil(height / patch_h)
+        patched_width = math.ceil(width / patch_w)
+        return patched_frames * patched_height * patched_width

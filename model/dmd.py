@@ -41,22 +41,44 @@ class DMD(SelfForcingModel):
         else:
             self.real_guidance_scale = args.guidance_scale
             self.fake_guidance_scale = 0.0
+        self.skip_real_uncond_when_guidance_zero = bool(
+            getattr(args, "skip_real_uncond_when_guidance_zero", False)
+        )
+        if self.skip_real_uncond_when_guidance_zero and self.real_guidance_scale != 0.0:
+            raise ValueError(
+                "skip_real_uncond_when_guidance_zero requires real guidance scale 0.0"
+            )
         self.timestep_shift = getattr(args, "timestep_shift", 1.0)
+        if getattr(args, "use_score_model_schedulers", False):
+            self.dmd_scheduler = self.real_score.get_scheduler()
+            self.critic_scheduler = self.fake_score.get_scheduler()
+        else:
+            self.dmd_scheduler = self.scheduler
+            self.critic_scheduler = self.scheduler
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
         self.min_score_timestep = getattr(args, "min_score_timestep", 0)
+        self.dmd_grad_fp32 = bool(getattr(args, "dmd_grad_fp32", False))
 
-        if getattr(self.scheduler, "alphas_cumprod", None) is not None:
-            self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
-        else:
-            self.scheduler.alphas_cumprod = None
+        for score_scheduler in {
+            self.scheduler,
+            self.dmd_scheduler,
+            self.critic_scheduler,
+        }:
+            if getattr(score_scheduler, "alphas_cumprod", None) is not None:
+                score_scheduler.alphas_cumprod = score_scheduler.alphas_cumprod.to(device)
+            else:
+                score_scheduler.alphas_cumprod = None
 
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
         conditional_dict: dict, unconditional_dict: dict,
-        normalization: bool = True
+        normalization: bool = True,
+        real_score=None,
+        fake_score=None,
+        real_guidance_scale=None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -71,15 +93,23 @@ class DMD(SelfForcingModel):
             - kl_grad: a tensor representing the KL grad.
             - kl_log_dict: a dictionary containing the intermediate tensors for logging.
         """
+        real_score = self.real_score if real_score is None else real_score
+        fake_score = self.fake_score if fake_score is None else fake_score
+        real_guidance_scale = (
+            self.real_guidance_scale
+            if real_guidance_scale is None
+            else float(real_guidance_scale)
+        )
+
         # Step 1: Compute the fake score
-        _, pred_fake_image_cond = self.fake_score(
+        _, pred_fake_image_cond = fake_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep=timestep
         )
 
         if self.fake_guidance_scale != 0.0:
-            _, pred_fake_image_uncond = self.fake_score(
+            _, pred_fake_image_uncond = fake_score(
                 noisy_image_or_video=noisy_image_or_video,
                 conditional_dict=unconditional_dict,
                 timestep=timestep
@@ -93,24 +123,38 @@ class DMD(SelfForcingModel):
         # Step 2: Compute the real score
         # We compute the conditional and unconditional prediction
         # and add them together to achieve cfg (https://arxiv.org/abs/2207.12598)
-        _, pred_real_image_cond = self.real_score(
+        _, pred_real_image_cond = real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep=timestep
         )
 
-        _, pred_real_image_uncond = self.real_score(
-            noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=unconditional_dict,
-            timestep=timestep
-        )
+        if (
+            self.skip_real_uncond_when_guidance_zero
+            and real_guidance_scale == 0.0
+        ):
+            pred_real_image = pred_real_image_cond
+        else:
+            _, pred_real_image_uncond = real_score(
+                noisy_image_or_video=noisy_image_or_video,
+                conditional_dict=unconditional_dict,
+                timestep=timestep
+            )
 
-        pred_real_image = pred_real_image_cond + (
-            pred_real_image_cond - pred_real_image_uncond
-        ) * self.real_guidance_scale
+            pred_real_image = pred_real_image_cond + (
+                pred_real_image_cond - pred_real_image_uncond
+            ) * real_guidance_scale
+
+        # Promote before subtraction/reduction; keep score forwards and CFG
+        # unchanged so this option isolates DMD gradient arithmetic precision.
+        if getattr(self, "dmd_grad_fp32", False):
+            pred_fake_image = pred_fake_image.float()
+            pred_real_image = pred_real_image.float()
+            estimated_clean_image_or_video = estimated_clean_image_or_video.float()
 
         # Step 3: Compute the DMD gradient (DMD paper eq. 7).
         grad = (pred_fake_image - pred_real_image)
+        score_delta = grad.detach().float()
 
         # TODO: Change the normalizer for causal teacher
         if normalization:
@@ -120,10 +164,20 @@ class DMD(SelfForcingModel):
             grad = grad / normalizer
         grad = torch.nan_to_num(grad)
 
-        return grad, {
+        log_dict = {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
+            "dmd_score_delta_abs_mean": score_delta.abs().mean(),
+            "dmd_score_delta_rms": score_delta.square().mean().sqrt(),
             "timestep": timestep.detach()
         }
+        if normalization:
+            normalizer_stats = normalizer.detach().float()
+            log_dict.update({
+                "dmd_normalizer_mean": normalizer_stats.mean(),
+                "dmd_normalizer_min": normalizer_stats.min(),
+                "dmd_normalizer_max": normalizer_stats.max(),
+            })
+        return grad, log_dict
 
     def compute_distribution_matching_loss(
         self,
@@ -170,7 +224,7 @@ class DMD(SelfForcingModel):
             timestep = timestep.clamp(self.min_step, self.max_step)
 
             noise = torch.randn_like(image_or_video)
-            noisy_latent = self.scheduler.add_noise(
+            noisy_latent = self.dmd_scheduler.add_noise(
                 image_or_video.flatten(0, 1),
                 noise.flatten(0, 1),
                 timestep.flatten(0, 1)
@@ -265,6 +319,23 @@ class DMD(SelfForcingModel):
                 initial_latent=initial_latent
             )
 
+        return self._critic_loss_from_generated(
+            generated_image=generated_image,
+            conditional_dict=conditional_dict,
+            denoised_timestep_from=denoised_timestep_from,
+            denoised_timestep_to=denoised_timestep_to,
+        )
+
+    def _critic_loss_from_generated(
+        self,
+        generated_image: torch.Tensor,
+        conditional_dict: dict,
+        denoised_timestep_from: int = 0,
+        denoised_timestep_to: int = 0,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Fit the fake score to a generated full video."""
+        image_or_video_shape = list(generated_image.shape)
+
         # Step 2: Compute the fake prediction
         min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
         max_timestep = denoised_timestep_from if self.ts_schedule_max and denoised_timestep_from is not None else self.num_train_timestep
@@ -284,7 +355,7 @@ class DMD(SelfForcingModel):
         critic_timestep = critic_timestep.clamp(self.min_step, self.max_step)
 
         critic_noise = torch.randn_like(generated_image)
-        noisy_generated_image = self.scheduler.add_noise(
+        noisy_generated_image = self.critic_scheduler.add_noise(
             generated_image.flatten(0, 1),
             critic_noise.flatten(0, 1),
             critic_timestep.flatten(0, 1)
@@ -300,7 +371,7 @@ class DMD(SelfForcingModel):
         if self.args.denoising_loss_type == "flow":
             from utils.wan_wrapper import WanDiffusionWrapper
             flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
-                scheduler=self.scheduler,
+                scheduler=self.critic_scheduler,
                 x0_pred=pred_fake_image.flatten(0, 1),
                 xt=noisy_generated_image.flatten(0, 1),
                 timestep=critic_timestep.flatten(0, 1)
@@ -308,7 +379,7 @@ class DMD(SelfForcingModel):
             pred_fake_noise = None
         else:
             flow_pred = None
-            pred_fake_noise = self.scheduler.convert_x0_to_noise(
+            pred_fake_noise = self.critic_scheduler.convert_x0_to_noise(
                 x0=pred_fake_image.flatten(0, 1),
                 xt=noisy_generated_image.flatten(0, 1),
                 timestep=critic_timestep.flatten(0, 1)
@@ -319,7 +390,7 @@ class DMD(SelfForcingModel):
             x_pred=pred_fake_image.flatten(0, 1),
             noise=critic_noise.flatten(0, 1),
             noise_pred=pred_fake_noise,
-            alphas_cumprod=self.scheduler.alphas_cumprod,
+            alphas_cumprod=self.critic_scheduler.alphas_cumprod,
             timestep=critic_timestep.flatten(0, 1),
             flow_pred=flow_pred
         )

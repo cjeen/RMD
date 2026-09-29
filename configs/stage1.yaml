@@ -1,0 +1,85 @@
+generator_ckpt: ${oc.env:CAUSAL_ODE_CKPT,checkpoints/causal-forcing/framewise/causal_ode.pt}
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-14B
+real_score_lora_path: ${oc.env:TEACHER_LORA,checkpoints/rmd/training/teacher_lora/adapter_model.bin}
+real_score_lora_adapter_name: default
+real_score_lora_rank: 128
+real_score_lora_target_modules:
+- q
+- k
+- v
+- o
+- ffn.0
+- ffn.2
+fake_score_ckpt: ${oc.env:FAKE_SCORE_CKPT,checkpoints/rmd/training/fake_score.pt}
+first_frame_real_name: Wan2.1-T2V-14B
+first_frame_fake_name: Wan2.1-T2V-1.3B
+first_frame_real_score_fsdp_wrap_strategy: size
+first_frame_fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 1.0
+denoising_loss_type: flow
+
+mixed_precision: true
+seed: 45
+sharding_strategy: hybrid_full
+
+lr: 2.0e-5
+lr_critic: 2.0e-5
+lr_first_frame_critic: 2.0e-5
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+max_grad_norm_generator: 10.0
+max_grad_norm_critic: 10.0
+batch_size: 1
+num_workers: 8
+
+data_format: precomputed_wan_jsonl
+data_meta_path: ${oc.env:TRAIN_META,data/train.jsonl}
+i2v: false
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+
+distribution_loss: rmd
+trainer: score_distillation
+phase_schedule: five_critic_one_generator
+dfake_gen_update_ratio: 6
+num_training_frames: 21
+num_frame_per_block: 1
+independent_frame_chunk_size: 1
+same_step_across_blocks: true
+last_step_only: true
+random_first_block_exit: true
+text_tf_replay_hide_generated_first_frame: true
+tf_replay_hide_first_frame_after: 10
+tf_replay_hide_first_frame_prob: 1.0
+gradient_checkpointing: true
+load_raw_video: false
+
+log_iters: 150
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 21
+
+# Count outer training iterations, as in the original experiment.
+max_steps: 900
