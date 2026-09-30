@@ -1,0 +1,16 @@
+/* Small RMD additions to the original Nerfies/Bulma template. */
+.author-notes { margin-top: .75rem; font-size: .9rem; }
+.publication-authors .author-block { margin-inline: .15rem; }
+figcaption { margin-top: 1rem; line-height: 1.6; }
+.publication-video iframe { border: 0; }
+.publication-links .icon svg { width: 1em; height: 1em; }
+#long-videos .video-container,
+#multi-prompt .video-container,
+#comparisons .video-container { width: 100%; max-width: 1800px; }
+.video-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: clamp(6px, 1vw, 20px); }
+.video-strip .publication-video { width: 100%; min-width: 0; height: 0; padding-bottom: 56.25%; }
+.comparison-player { width: 100%; max-width: 1200px; margin-inline: auto; }
+a:focus-visible { outline: 3px solid #3273dc; outline-offset: 4px; }
+@media screen and (max-width: 768px) {
+  .publication-title.title.is-1 { font-size: 2rem; }
+}
