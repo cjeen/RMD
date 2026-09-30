@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<!-- Adapted from Nerfies (CC BY-SA 4.0). See WEBSITE-LICENSE.txt for attribution and modification notices. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="description" content="Rollout-Marginal Distillation for Long-Horizon Autoregressive Video Generation.">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RMD: Rollout-Marginal Distillation</title>
+  <link rel="canonical" href="https://cjeen.github.io/RMD/">
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+  <link rel="stylesheet" href="./static/css/rmd.css">
+</head>
+<body>
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title">Rollout-Marginal Distillation for Long-Horizon Autoregressive Video Generation</h1>
+          <div class="is-size-5 publication-authors">
+            <span class="author-block"><a href="https://scholar.google.com/citations?user=BXoHuGwAAAAJ">Chenjian Gao</a><sup>1,2*</sup>,</span>
+            <span class="author-block"><a href="https://scholar.google.com/citations?user=4nBRRYMAAAAJ">Zhihao Hu</a><sup>2*</sup>,</span>
+            <span class="author-block"><a href="https://scholar.google.com/citations?user=kQUJjQQAAAAJ">Jianqi Ma</a><sup>2</sup>,</span>
+            <span class="author-block"><a href="https://scholar.google.com/citations?user=xUMuDgwAAAAJ">Jun Zhang</a><sup>2†</sup>,</span>
+            <span class="author-block"><a href="https://scholar.google.com/citations?user=EQAiIvUAAAAJ">Weidong Zhang</a><sup>2</sup>,</span>
+            <span class="author-block"><a href="https://scholar.google.com/citations?user=RfSQKrIAAAAJ">Tianfan Xue</a><sup>1†</sup></span>
+          </div>
+          <div class="is-size-5 publication-authors">
+            <span class="author-block"><sup>1</sup>MMLab, The Chinese University of Hong Kong</span>
+            <span class="author-block"><sup>2</sup>Tencent AIPD</span>
+          </div>
+          <p class="author-notes"><sup>*</sup>Equal contribution &nbsp; <sup>†</sup>Corresponding authors</p>
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <span class="link-block"><a href="https://arxiv.org/pdf/2609.37925" class="external-link button is-normal is-rounded is-dark">
+                <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h6"/></svg></span>
+                <span>Paper</span></a></span>
+              <span class="link-block"><a href="https://github.com/cjeen/RMD" class="external-link button is-normal is-rounded is-dark">
+                <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor" focusable="false"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.7-1.3-1.7-1.1-.8.1-.8.1-.8 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 5 18.3 5.3 18.3 5.3c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .3z"/></svg></span>
+                <span>Code</span></a></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="hero teaser">
+  <div class="container is-max-desktop">
+    <div class="hero-body">
+      <h2 class="subtitle has-text-centered"><strong>Train on 5 seconds. Generate far beyond.</strong></h2>
+      <figure>
+        <a href="./images/supervision_comparison.png">
+          <img src="./images/supervision_comparison.png" width="1800" height="859" fetchpriority="high"
+            alt="Real-score predictions for an owl rollout: video-level DMD retains historical artifacts, while RMD independently provides cleaner appearance targets.">
+        </a>
+        <figcaption class="has-text-centered">Video-level DMD can retain artifacts from the generated history. RMD scores each chunk independently, providing a clean target despite degraded context.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="overview">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">TL;DR</h2>
+        <div class="content has-text-justified">
+          <p><strong>Rollout-Marginal Distillation (RMD) keeps history for generation and evaluates appearance independently.</strong> By scoring each chunk without temporal context, RMD provides a cleaner visual-quality target, followed by video-level refinement to restore temporal coherence. Trained on 5-second rollouts, it helps autoregressive video generators preserve visual quality beyond the training horizon.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="long-videos">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3 has-text-centered">Long-Horizon Generation</h2>
+    <div class="columns is-centered is-multiline">
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/eN7eowr18K0" title="Long-Horizon Generation: Surf foam" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Surf foam · <a href="https://youtu.be/eN7eowr18K0">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/uvVKWmstz9Q" title="Long-Horizon Generation: Flame" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Flame · <a href="https://youtu.be/uvVKWmstz9Q">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/ed29mF4ZXI4" title="Long-Horizon Generation: Rain" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Rain · <a href="https://youtu.be/ed29mF4ZXI4">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="multi-prompt">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3 has-text-centered">Multi-Prompt Generation</h2>
+    <div class="columns is-centered is-multiline">
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/QlcwwR9cK4Q" title="Multi-Prompt Generation: Nature" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Nature · <a href="https://youtu.be/QlcwwR9cK4Q">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/jpqGERbJw6Q" title="Multi-Prompt Generation: Embers" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Embers · <a href="https://youtu.be/jpqGERbJw6Q">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/yCSD72aUccI" title="Multi-Prompt Generation: Melt" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Melt · <a href="https://youtu.be/yCSD72aUccI">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+      <div class="column is-half">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/ntZP11PkRrk" title="Multi-Prompt Generation: Wax" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Wax · <a href="https://youtu.be/ntZP11PkRrk">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="comparisons">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3 has-text-centered">Comparisons</h2>
+    <div class="columns is-centered is-multiline">
+      <div class="column is-full">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/wcZUJPeQX2Y" title="Comparisons: Comparison 1" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Comparison 1 · <a href="https://youtu.be/wcZUJPeQX2Y">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+      <div class="column is-full">
+        <figure>
+          <div class="publication-video">
+            <iframe src="https://www.youtube-nocookie.com/embed/bQ5naHsxn7E" title="Comparisons: Comparison 2" loading="lazy"
+              referrerpolicy="strict-origin-when-cross-origin" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+          </div>
+          <figcaption class="has-text-centered">Comparison 2 · <a href="https://youtu.be/bQ5naHsxn7E">Watch on YouTube</a></figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="method">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3 has-text-centered">Rollout-Marginal Training</h2>
+    <figure>
+      <a href="./images/method.png"><img src="./images/method.png" width="1800" height="881" loading="lazy"
+        alt="A causal generator produces a rollout. Adapted score networks supervise chunks independently, and gradients flow through differentiable causal replay."></a>
+      <figcaption class="has-text-centered">Independent appearance supervision, followed by video-level refinement. Teachers and critics are used only during training.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title is-3">BibTeX</h2>
+    <pre><code>@article{gao2026rmd,
+  title   = {Rollout-Marginal Distillation for Long-Horizon Autoregressive Video Generation},
+  author  = {Gao, Chenjian and Hu, Zhihao and Ma, Jianqi and Zhang, Jun and Zhang, Weidong and Xue, Tianfan},
+  journal = {arXiv preprint arXiv:2609.37925},
+  year    = {2026}
+}</code></pre>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="columns is-centered">
+      <div class="column is-8">
+        <div class="content">
+          <p>This website template is borrowed from <a href="https://nerfies.github.io/">Nerfies</a>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+</body>
+</html>

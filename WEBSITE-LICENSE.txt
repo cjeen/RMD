@@ -1,0 +1,16 @@
+This website is adapted from the Nerfies website by its contributors.
+Original website: https://nerfies.github.io/
+Template source: https://github.com/nerfies/nerfies.github.io
+Template revision: 657409a62d59a93163872c0e4921cf651b987810
+
+The template and adapted website source are licensed under Creative Commons
+Attribution-ShareAlike 4.0 International (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/
+Legal code: https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+Changes: RMD content, authors, figures, video sections and citation were added;
+the original analytics and unused interactive components were removed.
+
+Bulma retains its MIT license (static/css/BULMA-LICENSE.txt).
+Research code, model assets and linked third-party videos retain their
+respective licenses; this notice does not relicense those assets.
